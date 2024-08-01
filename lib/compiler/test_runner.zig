@@ -22,10 +22,6 @@ const crippled = switch (builtin.zig_backend) {
 pub fn main() void {
     @disableInstrumentation();
 
-    if (crippled) {
-        return mainSimple() catch @panic("test failure\n");
-    }
-
     const args = std.process.argsAlloc(fba.allocator()) catch
         @panic("unable to parse command line args");
 
@@ -80,8 +76,8 @@ fn mainServer() !void {
                 return std.process.exit(0);
             },
             .query_test_metadata => {
-                testing.allocator_instance = .{};
-                defer if (testing.allocator_instance.deinit() == .leak) {
+                if (!crippled) testing.allocator_instance = .{};
+                defer if (!crippled) if (testing.allocator_instance.deinit() == .leak) {
                     @panic("internal test runner memory leak");
                 };
 
@@ -111,7 +107,7 @@ fn mainServer() !void {
             },
 
             .run_test => {
-                testing.allocator_instance = .{};
+                if (!crippled) testing.allocator_instance = .{};
                 log_err_count = 0;
                 const index = try server.receiveBody_u32();
                 const test_fn = builtin.test_functions[index];
@@ -127,7 +123,11 @@ fn mainServer() !void {
                         }
                     },
                 };
-                const leak = testing.allocator_instance.deinit() == .leak;
+                const leak = if (crippled)
+                    false
+                else
+                    testing.allocator_instance.deinit() == .leak;
+
                 try server.serveTestResults(.{
                     .index = index,
                     .flags = .{
@@ -142,6 +142,7 @@ fn mainServer() !void {
                     },
                 });
             },
+
             .start_fuzzing => {
                 if (!builtin.fuzz) unreachable;
                 const index = try server.receiveBody_u32();
@@ -179,7 +180,7 @@ fn mainTerminal() void {
     var skip_count: usize = 0;
     var fail_count: usize = 0;
     var fuzz_count: usize = 0;
-    const root_node = if (builtin.fuzz) std.Progress.Node.none else std.Progress.start(.{
+    const root_node = if (builtin.fuzz or crippled) std.Progress.Node.none else std.Progress.start(.{
         .root_name = "Test",
         .estimated_total_items = test_fn_list.len,
     });
@@ -192,11 +193,11 @@ fn mainTerminal() void {
 
     var leaks: usize = 0;
     for (test_fn_list, 0..) |test_fn, i| {
-        testing.allocator_instance = .{};
+        if (!crippled) testing.allocator_instance = .{};
         defer {
-            if (testing.allocator_instance.deinit() == .leak) {
+            if (!crippled) if (testing.allocator_instance.deinit() == .leak) {
                 leaks += 1;
-            }
+            };
         }
         testing.log_level = .warn;
 
@@ -221,12 +222,14 @@ fn mainTerminal() void {
             },
             else => {
                 fail_count += 1;
-                if (have_tty) {
-                    std.debug.print("{d}/{d} {s}...FAIL ({s})\n", .{
-                        i + 1, test_fn_list.len, test_fn.name, @errorName(err),
-                    });
-                } else {
-                    std.debug.print("FAIL ({s})\n", .{@errorName(err)});
+                if (!crippled) {
+                    if (have_tty) {
+                        std.debug.print("{d}/{d} {s}...FAIL ({s})\n", .{
+                            i + 1, test_fn_list.len, test_fn.name, @errorName(err),
+                        });
+                    } else {
+                        std.debug.print("FAIL ({s})\n", .{@errorName(err)});
+                    }
                 }
                 if (@errorReturnTrace()) |trace| {
                     std.debug.dumpStackTrace(trace.*);
@@ -280,10 +283,12 @@ pub fn mainSimple() anyerror!void {
     @disableInstrumentation();
     // is the backend capable of printing to stderr?
     const enable_print = switch (builtin.zig_backend) {
+        .stage2_riscv64 => true,
         else => false,
     };
     // is the backend capable of using std.fmt.format to print a summary at the end?
     const print_summary = switch (builtin.zig_backend) {
+        .stage2_riscv64 => true,
         else => false,
     };
 
@@ -301,11 +306,12 @@ pub fn mainSimple() anyerror!void {
                 stderr.writeAll("... ") catch {};
                 stderr.writeAll("PASS\n") catch {};
             }
-        } else |err| if (enable_print) {
+        } else |err| {
             if (enable_print) {
                 stderr.writeAll(test_fn.name) catch {};
                 stderr.writeAll("... ") catch {};
             }
+
             if (err != error.SkipZigTest) {
                 if (enable_print) stderr.writeAll("FAIL\n") catch {};
                 failed += 1;

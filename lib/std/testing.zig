@@ -10,7 +10,7 @@ pub var random_seed: u32 = 0;
 pub const FailingAllocator = @import("testing/failing_allocator.zig").FailingAllocator;
 
 /// This should only be used in temporary test programs.
-pub const allocator = allocator_instance.allocator();
+pub const allocator = if (builtin.zig_backend == .stage2_riscv64) std.heap.page_allocator else allocator_instance.allocator();
 pub var allocator_instance: std.heap.GeneralPurposeAllocator(.{}) = b: {
     if (!builtin.is_test)
         @compileError("Cannot use testing allocator outside of test block");

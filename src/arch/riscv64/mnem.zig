@@ -1,6 +1,7 @@
 pub const Mnemonic = enum(u16) {
     // Arithmetics
     addi,
+    addiw,
     add,
     addw,
 
@@ -151,6 +152,7 @@ pub const Mnemonic = enum(u16) {
     vsetvli,
     vsetivli,
     vaddvv,
+    vadcvv,
     vfaddvv,
     vsubvv,
     vfsubvv,
@@ -168,8 +170,17 @@ pub const Mnemonic = enum(u16) {
     vse32v,
     vse64v,
 
-    vadcvv,
     vmvvx,
+    vmvxs,
+
+    vredsumvs,
+    vredandvs,
+    vredorvs,
+    vredxorvs,
+    vredminuvs,
+    vredminvs,
+    vredmaxuvs,
+    vredmaxvs,
 
     // Zbb Extension Instructions
     clz,
@@ -214,6 +225,11 @@ pub const Mnemonic = enum(u16) {
     /// Pseudo-instruction that will generate a backpatched
     /// function epilogue
     pseudo_epilogue,
+
+    /// Pseudo-instruction that generates a sequence of instructions
+    /// for adding large numbers to registers.
+    /// Acts as an `addi` instruction.
+    pseudo_large_addi,
 
     /// Pseudo-instruction: End of prologue
     pseudo_dbg_prologue_end,

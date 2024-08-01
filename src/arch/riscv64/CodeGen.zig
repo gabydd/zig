@@ -235,9 +235,8 @@ const MCValue = union(enum) {
             .load_symbol,
             .load_tlv,
             .indirect,
+            .load_frame,
             => true,
-
-            .load_frame => |frame_addr| !frame_addr.index.isNamed(),
         };
     }
 
@@ -256,7 +255,7 @@ const MCValue = union(enum) {
             .lea_symbol,
             .lea_tlv,
             .reserved_frame,
-            => unreachable, // not in memory
+            => std.debug.panic("not in memory: {s}", .{@tagName(mcv)}), // not in memory
 
             .load_symbol => |sym_off| .{ .lea_symbol = sym_off },
             .load_tlv => |sym| .{ .lea_tlv = sym },
@@ -339,6 +338,34 @@ const MCValue = union(enum) {
             .register_offset, .indirect => |*ro| @as(*const [1]Register, &ro.reg),
             else => &.{},
         };
+    }
+
+    fn fmt(mcv: MCValue) std.fmt.Formatter(format2) {
+        return .{ .data = mcv };
+    }
+
+    fn format2(
+        mcv: MCValue,
+        comptime _: []const u8,
+        _: std.fmt.FormatOptions,
+        writer: anytype,
+    ) !void {
+        switch (mcv) {
+            inline .lea_frame,
+            .load_frame,
+            => |frame| try writer.print(
+                "{s}(idx: %{d}, off: {d})",
+                .{ @tagName(mcv), @intFromEnum(frame.index), frame.off },
+            ),
+            inline .lea_symbol,
+            .load_symbol,
+            => |sym| try writer.print(
+                "{s}(sym: {d}, off: {d})",
+                .{ @tagName(mcv), sym.sym, sym.off },
+            ),
+            .register => |reg| try writer.print("reg({s})", .{@tagName(reg)}),
+            else => try writer.print("{}", .{mcv}),
+        }
     }
 };
 
@@ -827,7 +854,7 @@ pub fn generate(
     );
 
     const fn_info = zcu.typeToFunc(fn_type).?;
-    var call_info = function.resolveCallingConventionValues(fn_info, &.{}) catch |err| switch (err) {
+    var call_info = function.resolveCallingConventionValues(fn_info, &.{}, .args_frame) catch |err| switch (err) {
         error.CodegenFail => return error.CodegenFail,
         else => |e| return e,
     };
@@ -906,6 +933,7 @@ pub fn generateLazy(
     const comp = bin_file.comp;
     const gpa = comp.gpa;
     const mod = comp.root_mod;
+    const zcu = comp.zcu.?;
 
     var function: Func = .{
         .gpa = gpa,
@@ -929,7 +957,39 @@ pub fn generateLazy(
         .avl = null,
         .vtype = null,
     };
-    defer function.mir_instructions.deinit(gpa);
+    defer {
+        function.mir_instructions.deinit(gpa);
+        function.frame_allocs.deinit(gpa);
+    }
+
+    try function.frame_allocs.resize(gpa, FrameIndex.named_count);
+    function.frame_allocs.set(
+        @intFromEnum(FrameIndex.stack_frame),
+        FrameAlloc.init(.{
+            .size = 0,
+            .alignment = .@"1",
+        }),
+    );
+    function.frame_allocs.set(
+        @intFromEnum(FrameIndex.call_frame),
+        FrameAlloc.init(.{ .size = 0, .alignment = .@"1" }),
+    );
+    function.frame_allocs.set(@intFromEnum(FrameIndex.ret_addr), FrameAlloc.init(.{
+        .size = Type.u64.abiSize(zcu),
+        .alignment = Type.u64.abiAlignment(zcu),
+    }));
+    function.frame_allocs.set(@intFromEnum(FrameIndex.base_ptr), FrameAlloc.init(.{
+        .size = Type.u64.abiSize(zcu),
+        .alignment = Alignment.fromNonzeroByteUnits(function.target.stackAlignment()),
+    }));
+    function.frame_allocs.set(@intFromEnum(FrameIndex.args_frame), FrameAlloc.init(.{
+        .size = 0,
+        .alignment = .@"1",
+    }));
+    function.frame_allocs.set(@intFromEnum(FrameIndex.spill_frame), FrameAlloc.init(.{
+        .size = 0,
+        .alignment = Type.u64.abiAlignment(zcu),
+    }));
 
     function.genLazy(lazy_sym) catch |err| switch (err) {
         error.CodegenFail => return error.CodegenFail,
@@ -980,44 +1040,8 @@ fn formatWipMir(
     _: std.fmt.FormatOptions,
     writer: anytype,
 ) @TypeOf(writer).Error!void {
-    const pt = data.func.pt;
-    const comp = pt.zcu.comp;
-    var lower: Lower = .{
-        .pt = pt,
-        .allocator = data.func.gpa,
-        .mir = .{
-            .instructions = data.func.mir_instructions.slice(),
-            .frame_locs = data.func.frame_locs.slice(),
-        },
-        .cc = .auto,
-        .src_loc = data.func.src_loc,
-        .output_mode = comp.config.output_mode,
-        .link_mode = comp.config.link_mode,
-        .pic = comp.root_mod.pic,
-    };
-    var first = true;
-    for ((lower.lowerMir(data.inst, .{ .allow_frame_locs = false }) catch |err| switch (err) {
-        error.LowerFail => {
-            defer {
-                lower.err_msg.?.deinit(data.func.gpa);
-                lower.err_msg = null;
-            }
-            try writer.writeAll(lower.err_msg.?.msg);
-            return;
-        },
-        error.OutOfMemory, error.InvalidInstruction => |e| {
-            try writer.writeAll(switch (e) {
-                error.OutOfMemory => "Out of memory",
-                error.InvalidInstruction => "CodeGen failed to find a viable instruction.",
-            });
-            return;
-        },
-        else => |e| return e,
-    }).insts) |lowered_inst| {
-        if (!first) try writer.writeAll("\ndebug(wip_mir): ");
-        try writer.print("  | {}", .{lowered_inst});
-        first = false;
-    }
+    const inst = data.func.mir_instructions.get(data.inst);
+    try writer.print("{}", .{inst});
 }
 fn fmtWipMir(func: *Func, inst: Mir.Inst.Index) std.fmt.Formatter(formatWipMir) {
     return .{ .data = .{ .func = func, .inst = inst } };
@@ -1194,7 +1218,7 @@ fn gen(func: *Func) !void {
     if (fn_info.cc != .naked) {
         _ = try func.addPseudo(.pseudo_dbg_prologue_end);
 
-        const backpatch_stack_alloc = try func.addPseudo(.pseudo_dead);
+        const backpatch_stack_adjust = try func.addPseudo(.pseudo_dead);
         const backpatch_ra_spill = try func.addPseudo(.pseudo_dead);
         const backpatch_fp_spill = try func.addPseudo(.pseudo_dead);
         const backpatch_fp_add = try func.addPseudo(.pseudo_dead);
@@ -1246,26 +1270,19 @@ fn gen(func: *Func) !void {
         const frame_layout = try func.computeFrameLayout();
         const need_save_reg = frame_layout.save_reg_list.count() > 0;
 
-        func.mir_instructions.set(backpatch_stack_alloc, .{
-            .tag = .addi,
-            .data = .{ .i_type = .{
-                .rd = .sp,
-                .rs1 = .sp,
-                .imm12 = Immediate.s(-@as(i32, @intCast(frame_layout.stack_adjust))),
-            } },
+        // prologue
+        func.mir_instructions.set(backpatch_stack_adjust, .{
+            .tag = .pseudo_large_addi,
+            .data = .{
+                .i_type = .{
+                    .rd = .sp,
+                    .rs1 = .sp,
+                    .imm12 = Immediate.s(-frame_layout.stack_adjust),
+                },
+            },
         });
         func.mir_instructions.set(backpatch_ra_spill, .{
             .tag = .pseudo_store_rm,
-            .data = .{ .rm = .{
-                .r = .ra,
-                .m = .{
-                    .base = .{ .frame = .ret_addr },
-                    .mod = .{ .size = .dword, .unsigned = false },
-                },
-            } },
-        });
-        func.mir_instructions.set(backpatch_ra_restore, .{
-            .tag = .pseudo_load_rm,
             .data = .{ .rm = .{
                 .r = .ra,
                 .m = .{
@@ -1284,6 +1301,26 @@ fn gen(func: *Func) !void {
                 },
             } },
         });
+        func.mir_instructions.set(backpatch_fp_add, .{
+            .tag = .pseudo_large_addi,
+            .data = .{ .i_type = .{
+                .rd = .s0,
+                .rs1 = .sp,
+                .imm12 = Immediate.s(frame_layout.stack_adjust),
+            } },
+        });
+
+        // epilogue
+        func.mir_instructions.set(backpatch_ra_restore, .{
+            .tag = .pseudo_load_rm,
+            .data = .{ .rm = .{
+                .r = .ra,
+                .m = .{
+                    .base = .{ .frame = .ret_addr },
+                    .mod = .{ .size = .dword, .unsigned = false },
+                },
+            } },
+        });
         func.mir_instructions.set(backpatch_fp_restore, .{
             .tag = .pseudo_load_rm,
             .data = .{ .rm = .{
@@ -1294,16 +1331,9 @@ fn gen(func: *Func) !void {
                 },
             } },
         });
-        func.mir_instructions.set(backpatch_fp_add, .{
-            .tag = .addi,
-            .data = .{ .i_type = .{
-                .rd = .s0,
-                .rs1 = .sp,
-                .imm12 = Immediate.s(@intCast(frame_layout.stack_adjust)),
-            } },
-        });
+
         func.mir_instructions.set(backpatch_stack_alloc_restore, .{
-            .tag = .addi,
+            .tag = .pseudo_large_addi,
             .data = .{ .i_type = .{
                 .rd = .sp,
                 .rs1 = .sp,
@@ -1347,8 +1377,13 @@ fn genLazy(func: *Func, lazy_sym: link.File.LazySymbol) InnerError!void {
             const enum_ty = Type.fromInterned(lazy_sym.ty);
             wip_mir_log.debug("{}.@tagName:", .{enum_ty.fmt(pt)});
 
+            const backpatch_stack_adjust = try func.addPseudo(.pseudo_dead);
+            const backpatch_fp_spill = try func.addPseudo(.pseudo_dead);
+            const backpatch_fp_add = try func.addPseudo(.pseudo_dead);
+            const backpatch_spill_callee_preserved_regs = try func.addPseudo(.pseudo_dead);
+
             const param_regs = abi.Registers.Integer.function_arg_regs;
-            const ret_reg = param_regs[0];
+            const ret_ptr_reg = param_regs[0];
             const enum_mcv: MCValue = .{ .register = param_regs[1] };
 
             const exitlude_jump_relocs = try func.gpa.alloc(Mir.Inst.Index, enum_ty.enumFieldCount(zcu));
@@ -1378,7 +1413,7 @@ fn genLazy(func: *Func, lazy_sym: link.File.LazySymbol) InnerError!void {
                 const tag_mcv = try func.genTypedValue(tag_val);
 
                 _ = try func.genBinOp(
-                    .cmp_neq,
+                    .cmp_eq,
                     enum_mcv,
                     enum_ty,
                     tag_mcv,
@@ -1386,16 +1421,14 @@ fn genLazy(func: *Func, lazy_sym: link.File.LazySymbol) InnerError!void {
                     cmp_reg,
                 );
                 const skip_reloc = try func.condBr(Type.bool, .{ .register = cmp_reg });
-
                 try func.genSetMem(
-                    .{ .reg = ret_reg },
+                    .{ .reg = ret_ptr_reg },
                     0,
                     Type.u64,
                     .{ .register_offset = .{ .reg = data_reg, .off = data_off } },
                 );
-
                 try func.genSetMem(
-                    .{ .reg = ret_reg },
+                    .{ .reg = ret_ptr_reg },
                     8,
                     Type.u64,
                     .{ .immediate = tag_name_len },
@@ -1416,6 +1449,69 @@ fn genLazy(func: *Func, lazy_sym: link.File.LazySymbol) InnerError!void {
             try func.airTrap();
 
             for (exitlude_jump_relocs) |reloc| func.performReloc(reloc);
+
+            const backpatch_restore_callee_preserved_regs = try func.addPseudo(.pseudo_dead);
+            const backpatch_fp_restore = try func.addPseudo(.pseudo_dead);
+            const backpatch_stack_alloc_restore = try func.addPseudo(.pseudo_dead);
+
+            const frame_layout = try func.computeFrameLayout();
+            const need_save_reg = frame_layout.save_reg_list.count() > 0;
+
+            if (need_save_reg) {
+                func.mir_instructions.set(backpatch_spill_callee_preserved_regs, .{
+                    .tag = .pseudo_spill_regs,
+                    .data = .{ .reg_list = frame_layout.save_reg_list },
+                });
+
+                func.mir_instructions.set(backpatch_restore_callee_preserved_regs, .{
+                    .tag = .pseudo_restore_regs,
+                    .data = .{ .reg_list = frame_layout.save_reg_list },
+                });
+            }
+            func.mir_instructions.set(backpatch_fp_add, .{
+                .tag = .addi,
+                .data = .{ .i_type = .{
+                    .rd = .s0,
+                    .rs1 = .sp,
+                    .imm12 = Immediate.s(@intCast(frame_layout.stack_adjust)),
+                } },
+            });
+            func.mir_instructions.set(backpatch_stack_alloc_restore, .{
+                .tag = .addi,
+                .data = .{ .i_type = .{
+                    .rd = .sp,
+                    .rs1 = .sp,
+                    .imm12 = Immediate.s(@intCast(frame_layout.stack_adjust)),
+                } },
+            });
+            func.mir_instructions.set(backpatch_stack_adjust, .{
+                .tag = .addi,
+                .data = .{ .i_type = .{
+                    .rd = .sp,
+                    .rs1 = .sp,
+                    .imm12 = Immediate.s(-@as(i32, @intCast(frame_layout.stack_adjust))),
+                } },
+            });
+            func.mir_instructions.set(backpatch_fp_spill, .{
+                .tag = .pseudo_store_rm,
+                .data = .{ .rm = .{
+                    .r = .s0,
+                    .m = .{
+                        .base = .{ .frame = .base_ptr },
+                        .mod = .{ .size = .dword, .unsigned = false },
+                    },
+                } },
+            });
+            func.mir_instructions.set(backpatch_fp_restore, .{
+                .tag = .pseudo_load_rm,
+                .data = .{ .rm = .{
+                    .r = .s0,
+                    .m = .{
+                        .base = .{ .frame = .base_ptr },
+                        .mod = .{ .size = .dword, .unsigned = false },
+                    },
+                } },
+            });
 
             _ = try func.addInst(.{
                 .tag = .jalr,
@@ -1798,7 +1894,7 @@ fn finishAir(
 }
 
 const FrameLayout = struct {
-    stack_adjust: i12,
+    stack_adjust: i32,
     save_reg_list: Mir.RegisterList,
 };
 
@@ -1918,7 +2014,7 @@ fn memSize(func: *Func, ty: Type) Memory.Size {
 
 fn splitType(func: *Func, ty: Type) ![2]Type {
     const zcu = func.pt.zcu;
-    const classes = mem.sliceTo(&abi.classifySystem(ty, zcu), .none);
+    const classes = mem.sliceTo(&abi.classifyCallingConvention(ty, zcu), .none);
     var parts: [2]Type = undefined;
     if (classes.len == 2) for (&parts, classes, 0..) |*part, class, part_i| {
         part.* = switch (class) {
@@ -2089,7 +2185,7 @@ fn allocRegOrMem(func: *Func, elem_ty: Type, inst: ?Air.Inst.Index, reg_ok: bool
     const bit_size = elem_ty.bitSize(zcu);
     const min_size: u64 = switch (elem_ty.zigTypeTag(zcu)) {
         .float => if (func.hasFeature(.d)) 64 else 32,
-        .vector => 256, // TODO: calculate it from avl * vsew
+        .vector => func.vectorBits(),
         else => 64,
     };
 
@@ -2097,8 +2193,6 @@ fn allocRegOrMem(func: *Func, elem_ty: Type, inst: ?Air.Inst.Index, reg_ok: bool
         if (func.register_manager.tryAllocReg(inst, func.regGeneralClassForType(elem_ty))) |reg| {
             return .{ .register = reg };
         }
-    } else if (reg_ok and elem_ty.zigTypeTag(zcu) == .vector) {
-        return func.fail("did you forget to extend vector registers before allocating", .{});
     }
 
     const frame_index = try func.allocFrameIndex(FrameAlloc.initSpill(elem_ty, zcu));
@@ -2123,6 +2217,34 @@ fn allocReg(func: *Func, reg_class: abi.RegisterClass) !struct { Register, Regis
     const reg = try func.register_manager.allocReg(null, class);
     const lock = func.register_manager.lockRegAssumeUnused(reg);
     return .{ reg, lock };
+}
+
+/// Used when register allocating a type which requires a length multiplier of
+/// of more than `m1`.
+///
+/// This function will allocate enough vector registers to store `ty`, but will return
+/// only the first one, as that's the one that should be addressed in instructions.
+///
+/// Assumes that `vtype` was setup before calling this function. Changing `vlmul` before
+/// unlocking these registers will lead to unexpected results.
+fn allocVecReg(func: *Func, ty: Type) !struct { Register, []const RegisterLock } {
+    assert(func.typeRegClass(ty) == .vector);
+    const zcu = func.pt.zcu;
+
+    const vb = func.vectorBits();
+    const ty_bits = ty.bitSize(zcu);
+    const num_regs = math.divCeil(u32, @intCast(ty_bits), vb) catch unreachable;
+
+    var locks = std.ArrayList(RegisterLock).init(func.gpa);
+    const base_reg = try func.register_manager.allocReg(null, abi.Registers.Vector.general_purpose);
+    for (0..num_regs) |i| {
+        const next_reg: Register = @enumFromInt(@intFromEnum(base_reg) + i);
+        try func.register_manager.getReg(next_reg, null);
+        const lock = func.register_manager.lockRegAssumeUnused(next_reg);
+        try locks.append(lock);
+    }
+
+    return .{ base_reg, try locks.toOwnedSlice() };
 }
 
 /// Similar to `allocReg` but will copy the MCValue into the Register unless `operand` is already
@@ -2452,7 +2574,7 @@ fn binOp(
     // don't have support for certain sizes of addition
     switch (lhs_ty.zigTypeTag(zcu)) {
         .vector => {}, // works differently and fails in a different place
-        else => if (lhs_ty.bitSize(zcu) > 64) return func.fail("TODO: binOp >= 64 bits", .{}),
+        else => if (lhs_ty.bitSize(zcu) > 64) return func.fail("TODO: binOp > 64 bits", .{}),
     }
 
     const lhs_mcv = try func.resolveInst(lhs_air);
@@ -2523,6 +2645,7 @@ fn genBinOp(
         .rem,
         .div_trunc,
         .div_exact,
+        .xor,
         => {
             switch (tag) {
                 .rem,
@@ -2569,6 +2692,7 @@ fn genBinOp(
                             8, 16, 32 => if (is_unsigned) .divuw else .divw,
                             else => if (is_unsigned) .divu else .div,
                         },
+                        .xor => .xor,
                         else => unreachable,
                     };
 
@@ -2639,14 +2763,10 @@ fn genBinOp(
                         else => return func.fail("TODO: genBinOp {s} Vector", .{@tagName(tag)}),
                     };
 
+                    const vsew = bits.VSew.fromBits(elem_size) orelse
+                        return func.fail("TODO: genBinOp > 64 bit elements, found {d}", .{elem_size});
                     try func.setVl(.zero, num_elem, .{
-                        .vsew = switch (elem_size) {
-                            8 => .@"8",
-                            16 => .@"16",
-                            32 => .@"32",
-                            64 => .@"64",
-                            else => return func.fail("TODO: genBinOp > 64 bit elements, found {d}", .{elem_size}),
-                        },
+                        .vsew = vsew,
                         .vlmul = .m1,
                         .vma = true,
                         .vta = true,
@@ -2993,68 +3113,7 @@ fn airAddWithOverflow(func: *Func, inst: Air.Inst.Index) !void {
 
                     break :result result_mcv;
                 } else {
-                    const rhs_mcv = try func.resolveInst(extra.rhs);
-                    const lhs_mcv = try func.resolveInst(extra.lhs);
-
-                    const rhs_reg, const rhs_lock = try func.promoteReg(rhs_ty, rhs_mcv);
-                    const lhs_reg, const lhs_lock = try func.promoteReg(lhs_ty, lhs_mcv);
-                    defer {
-                        if (rhs_lock) |lock| func.register_manager.unlockReg(lock);
-                        if (lhs_lock) |lock| func.register_manager.unlockReg(lock);
-                    }
-
-                    try func.truncateRegister(rhs_ty, rhs_reg);
-                    try func.truncateRegister(lhs_ty, lhs_reg);
-
-                    const dest_reg, const dest_lock = try func.allocReg(.int);
-                    defer func.register_manager.unlockReg(dest_lock);
-
-                    _ = try func.addInst(.{
-                        .tag = .add,
-                        .data = .{ .r_type = .{
-                            .rs1 = rhs_reg,
-                            .rs2 = lhs_reg,
-                            .rd = dest_reg,
-                        } },
-                    });
-
-                    try func.truncateRegister(func.typeOfIndex(inst), dest_reg);
-                    const add_result: MCValue = .{ .register = dest_reg };
-
-                    try func.genSetMem(
-                        .{ .frame = offset.index },
-                        offset.off + @as(i32, @intCast(tuple_ty.structFieldOffset(0, zcu))),
-                        lhs_ty,
-                        add_result,
-                    );
-
-                    const trunc_reg = try func.copyToTmpRegister(lhs_ty, add_result);
-                    const trunc_reg_lock = func.register_manager.lockRegAssumeUnused(trunc_reg);
-                    defer func.register_manager.unlockReg(trunc_reg_lock);
-
-                    const overflow_reg, const overflow_lock = try func.allocReg(.int);
-                    defer func.register_manager.unlockReg(overflow_lock);
-
-                    // if the result isn't equal after truncating it to the given type,
-                    // an overflow must have happened.
-                    try func.truncateRegister(lhs_ty, trunc_reg);
-                    try func.genBinOp(
-                        .cmp_neq,
-                        add_result,
-                        lhs_ty,
-                        .{ .register = trunc_reg },
-                        rhs_ty,
-                        overflow_reg,
-                    );
-
-                    try func.genSetMem(
-                        .{ .frame = offset.index },
-                        offset.off + @as(i32, @intCast(tuple_ty.structFieldOffset(1, zcu))),
-                        Type.u1,
-                        .{ .register = overflow_reg },
-                    );
-
-                    break :result result_mcv;
+                    return func.fail("TODO: airAddWithOverflow {d}", .{int_info.bits});
                 }
             },
             else => unreachable,
@@ -3853,9 +3912,11 @@ fn airArrayElemVal(func: *Func, inst: Air.Inst.Index) !void {
         if (array_ty.isVector(zcu)) {
             // we need to load the vector, vslidedown to get the element we want
             // and store that element in a load frame.
-
-            const src_reg, const src_lock = try func.allocReg(.vector);
-            defer func.register_manager.unlockReg(src_lock);
+            const src_reg, const src_locks = try func.allocVecReg(array_ty);
+            defer {
+                for (src_locks) |lock| func.register_manager.unlockReg(lock);
+                func.gpa.free(src_locks);
+            }
 
             // load the vector into a temporary register
             try func.genCopy(array_ty, .{ .register = src_reg }, .{ .indirect = .{ .reg = addr_reg } });
@@ -3867,7 +3928,6 @@ fn airArrayElemVal(func: *Func, inst: Air.Inst.Index) !void {
             // and can just copy to the frame index.
             if (!(index_mcv == .immediate and index_mcv.immediate == 0)) {
                 const index_reg = try func.copyToTmpRegister(Type.u64, index_mcv);
-
                 _ = try func.addInst(.{
                     .tag = .vslidedownvx,
                     .data = .{ .r_type = .{
@@ -4479,7 +4539,10 @@ fn load(func: *Func, dst_mcv: MCValue, ptr_mcv: MCValue, ptr_ty: Type) InnerErro
     const zcu = pt.zcu;
     const dst_ty = ptr_ty.childType(zcu);
 
-    log.debug("loading {}:{} into {}", .{ ptr_mcv, ptr_ty.fmt(pt), dst_mcv });
+    log.debug(
+        "loading {}:{} into {}",
+        .{ ptr_mcv.fmt(), ptr_ty.fmt(pt), dst_mcv.fmt() },
+    );
 
     switch (ptr_mcv) {
         .none,
@@ -4534,7 +4597,10 @@ fn airStore(func: *Func, inst: Air.Inst.Index, safety: bool) !void {
 fn store(func: *Func, ptr_mcv: MCValue, src_mcv: MCValue, ptr_ty: Type) !void {
     const zcu = func.pt.zcu;
     const src_ty = ptr_ty.childType(zcu);
-    log.debug("storing {}:{} in {}:{}", .{ src_mcv, src_ty.fmt(func.pt), ptr_mcv, ptr_ty.fmt(func.pt) });
+    log.debug(
+        "storing {}:{} in {}:{}",
+        .{ src_mcv.fmt(), src_ty.fmt(func.pt), ptr_mcv.fmt(), ptr_ty.fmt(func.pt) },
+    );
 
     switch (ptr_mcv) {
         .none => unreachable,
@@ -4667,16 +4733,19 @@ fn airStructFieldVal(func: *Func, inst: Air.Inst.Index) !void {
                     const field_bit_size = field_ty.bitSize(zcu);
 
                     if (field_abi_size <= 8) {
-                        const int_ty = try pt.intType(
-                            if (field_ty.isAbiInt(zcu)) field_ty.intInfo(zcu).signedness else .unsigned,
-                            @intCast(field_bit_size),
-                        );
+                        const dst_ty = if (field_ty.isRuntimeFloat())
+                            field_ty
+                        else
+                            try pt.intType(
+                                if (field_ty.isAbiInt(zcu)) field_ty.intInfo(zcu).signedness else .unsigned,
+                                @intCast(field_bit_size),
+                            );
 
-                        const dst_reg, const dst_lock = try func.allocReg(.int);
+                        const dst_reg, const dst_lock = try func.allocReg(func.typeRegClass(dst_ty));
                         const dst_mcv = MCValue{ .register = dst_reg };
                         defer func.register_manager.unlockReg(dst_lock);
 
-                        try func.genCopy(int_ty, dst_mcv, off_mcv);
+                        try func.genCopy(dst_ty, dst_mcv, off_mcv);
                         break :result try func.copyToNewRegister(inst, dst_mcv);
                     }
 
@@ -4862,7 +4931,7 @@ fn genCall(
     defer allocator.free(var_args);
     for (var_args, arg_tys[fn_info.param_types.len..]) |*var_arg, arg_ty| var_arg.* = arg_ty;
 
-    var call_info = try func.resolveCallingConventionValues(fn_info, var_args);
+    var call_info = try func.resolveCallingConventionValues(fn_info, var_args, .call_frame);
     defer call_info.deinit(func);
 
     // We need a properly aligned and sized call frame to be able to call this function.
@@ -4903,6 +4972,10 @@ fn genCall(
             .register_pair => |regs| {
                 for (regs) |reg| try func.register_manager.getReg(reg, null);
                 try reg_locks.appendSlice(&func.register_manager.lockRegs(2, regs));
+            },
+            .load_frame => {
+                try func.genCopy(arg_ty, dst_arg, src_arg);
+                try func.freeValue(src_arg);
             },
             .indirect => |reg_off| {
                 frame_index.* = try func.allocFrameIndex(FrameAlloc.initType(arg_ty, zcu));
@@ -5041,14 +5114,9 @@ fn airRet(func: *Func, inst: Air.Inst.Index, safety: bool) !void {
                 const bit_size = ret_ty.totalVectorBits(zcu);
 
                 // set the vtype to hold the entire vector's contents in a single element
+                const vsew = bits.VSew.fromBits(bit_size) orelse unreachable;
                 try func.setVl(.zero, 0, .{
-                    .vsew = switch (bit_size) {
-                        8 => .@"8",
-                        16 => .@"16",
-                        32 => .@"32",
-                        64 => .@"64",
-                        else => unreachable,
-                    },
+                    .vsew = vsew,
                     .vlmul = .m1,
                     .vma = true,
                     .vta = true,
@@ -6549,7 +6617,7 @@ fn genCopy(func: *Func, ty: Type, dst_mcv: MCValue, src_mcv: MCValue) !void {
             const addr_reg, const addr_lock = try func.allocReg(.int);
             defer func.register_manager.unlockReg(addr_lock);
 
-            try func.genSetReg(ty, addr_reg, dst_mcv.address());
+            try func.genSetReg(Type.u64, addr_reg, dst_mcv.address());
             try func.genCopy(ty, .{ .indirect = .{ .reg = addr_reg } }, src_mcv);
         },
         .memory => return func.fail("TODO: genCopy memory", .{}),
@@ -6785,13 +6853,20 @@ fn genSetReg(func: *Func, ty: Type, reg: Register, src_mcv: MCValue) InnerError!
     const pt = func.pt;
     const zcu = pt.zcu;
     const abi_size: u32 = @intCast(ty.abiSize(zcu));
+    const bit_size = if (ty.zigTypeTag(zcu) == .vector)
+        ty.childType(zcu).bitSize(zcu)
+    else
+        ty.bitSize(zcu);
 
     const max_size: u32 = switch (reg.class()) {
         .int => 64,
         .float => if (func.hasFeature(.d)) 64 else 32,
-        .vector => 64, // TODO: calculate it from avl * vsew
+        .vector => @intCast(ty.bitSize(zcu)), // it can be larger than a register because of the multiplier
     };
-    if (abi_size > max_size) return std.debug.panic("tried to set reg with size {}", .{abi_size});
+    if (bit_size > max_size) return std.debug.panic(
+        "tried to set {s} reg with size {}",
+        .{ @tagName(reg.class()), abi_size },
+    );
     const dst_reg_class = reg.class();
 
     switch (src_mcv) {
@@ -6886,22 +6961,16 @@ fn genSetReg(func: *Func, ty: Type, reg: Register, src_mcv: MCValue) InnerError!
             if (src_reg.id() == reg.id())
                 return;
 
-            // there is no instruction for loading the contents of a vector register
-            // into an integer register, however we can cheat a bit by setting the element
-            // size to the total size of the vector, and vmv.x.s will work then
-            if (src_reg.class() == .vector) {
+            if (src_reg.class() == .vector and reg.class() == .int) {
+                assert(ty.isVector(zcu)); // pass in the vector type
+                const elem_bits = ty.childType(zcu).bitSize(zcu);
                 try func.setVl(.zero, 0, .{
-                    .vsew = switch (ty.totalVectorBits(zcu)) {
-                        8 => .@"8",
-                        16 => .@"16",
-                        32 => .@"32",
-                        64 => .@"64",
-                        else => |vec_bits| return func.fail("TODO: genSetReg vec -> {s} bits {d}", .{
-                            @tagName(reg.class()),
-                            vec_bits,
-                        }),
-                    },
-                    .vlmul = .m1,
+                    .vsew = bits.VSew.fromBits(elem_bits) orelse
+                        return func.fail(
+                        "TODO: genSetReg vec -> int bits {d}, make sure to pass in the vector type itself",
+                        .{elem_bits},
+                    ),
+                    .vlmul = try func.suggestedVlMul(ty),
                     .vta = true,
                     .vma = true,
                 });
@@ -6926,7 +6995,7 @@ fn genSetReg(func: *Func, ty: Type, reg: Register, src_mcv: MCValue) InnerError!
                 const addr_reg, const addr_lock = try func.allocReg(.int);
                 defer func.register_manager.unlockReg(addr_lock);
 
-                try func.genCopy(ty, .{ .register = addr_reg }, src_mcv.address());
+                try func.genCopy(Type.u64, .{ .register = addr_reg }, src_mcv.address());
                 try func.genCopy(ty, .{ .register = reg }, .{ .indirect = .{ .reg = addr_reg } });
             } else {
                 _ = try func.addInst(.{
@@ -7010,17 +7079,11 @@ fn genSetReg(func: *Func, ty: Type, reg: Register, src_mcv: MCValue) InnerError!
                     // and load from it.
                     const len = ty.vectorLen(zcu);
                     const elem_ty = ty.childType(zcu);
-                    const elem_size = elem_ty.abiSize(zcu);
+                    const elem_size = elem_ty.bitSize(zcu);
 
                     try func.setVl(.zero, len, .{
-                        .vsew = switch (elem_size) {
-                            1 => .@"8",
-                            2 => .@"16",
-                            4 => .@"32",
-                            8 => .@"64",
-                            else => unreachable,
-                        },
-                        .vlmul = .m1,
+                        .vsew = bits.VSew.fromBits(elem_size) orelse unreachable,
+                        .vlmul = try func.suggestedVlMul(ty),
                         .vma = true,
                         .vta = true,
                     });
@@ -7070,7 +7133,7 @@ fn genSetReg(func: *Func, ty: Type, reg: Register, src_mcv: MCValue) InnerError!
             const addr_reg, const addr_lock = try func.allocReg(.int);
             defer func.register_manager.unlockReg(addr_lock);
 
-            try func.genSetReg(ty, addr_reg, src_mcv.address());
+            try func.genSetReg(Type.u64, addr_reg, src_mcv.address());
             try func.genSetReg(ty, reg, .{ .indirect = .{ .reg = addr_reg } });
         },
         .lea_tlv => |sym| {
@@ -7158,15 +7221,10 @@ fn genSetMem(
 
                 const num_elem = ty.vectorLen(zcu);
                 const elem_size = ty.childType(zcu).bitSize(zcu);
+                const vsew = bits.VSew.fromBits(elem_size) orelse unreachable;
 
                 try func.setVl(.zero, num_elem, .{
-                    .vsew = switch (elem_size) {
-                        8 => .@"8",
-                        16 => .@"16",
-                        32 => .@"32",
-                        64 => .@"64",
-                        else => unreachable,
-                    },
+                    .vsew = vsew,
                     .vlmul = .m1,
                     .vma = true,
                     .vta = true,
@@ -7847,13 +7905,19 @@ fn airMemset(func: *Func, inst: Air.Inst.Index, safety: bool) !void {
         if (elem_abi_size == 1) {
             const ptr: MCValue = switch (dst_ptr_ty.ptrSize(zcu)) {
                 // TODO: this only handles slices stored in the stack
-                .slice => dst_ptr,
+                .slice => if (dst_ptr == .register_pair)
+                    .{ .register = dst_ptr.register_pair[0] }
+                else
+                    dst_ptr,
                 .one => dst_ptr,
                 .c, .many => unreachable,
             };
             const len: MCValue = switch (dst_ptr_ty.ptrSize(zcu)) {
                 // TODO: this only handles slices stored in the stack
-                .slice => dst_ptr.address().offset(8).deref(),
+                .slice => if (dst_ptr == .register_pair)
+                    .{ .register = dst_ptr.register_pair[1] }
+                else
+                    dst_ptr.address().offset(8).deref(),
                 .one => .{ .immediate = dst_ptr_ty.childType(zcu).arrayLen(zcu) },
                 .c, .many => unreachable,
             };
@@ -7949,9 +8013,6 @@ fn airTagName(func: *Func, inst: Air.Inst.Index) !void {
     const result: MCValue = if (func.liveness.isUnused(inst)) .unreach else result: {
         const enum_ty = func.typeOf(un_op);
 
-        // TODO: work out the bugs
-        if (true) return func.fail("TODO: airTagName", .{});
-
         const param_regs = abi.Registers.Integer.function_arg_regs;
         const dst_mcv = try func.allocRegOrMem(Type.u64, inst, false);
         try func.genSetReg(Type.u64, param_regs[0], dst_mcv.address());
@@ -7960,7 +8021,7 @@ fn airTagName(func: *Func, inst: Air.Inst.Index) !void {
         try func.genSetReg(enum_ty, param_regs[1], operand);
 
         const lazy_sym: link.File.LazySymbol = .{ .kind = .code, .ty = enum_ty.toIntern() };
-        const elf_file = func.bin_file.cast(link.File.Elf).?;
+        const elf_file = func.bin_file.cast(.elf).?;
         const zo = elf_file.zigObjectPtr().?;
         const sym_index = zo.getOrCreateMetadataForLazySymbol(elf_file, pt, lazy_sym) catch |err|
             return func.fail("{s} creating lazy symbol", .{@errorName(err)});
@@ -7968,7 +8029,7 @@ fn airTagName(func: *Func, inst: Air.Inst.Index) !void {
         if (func.mod.pic) {
             return func.fail("TODO: airTagName pic", .{});
         } else {
-            try func.genSetReg(Type.u64, .ra, .{ .load_symbol = .{ .sym = sym_index } });
+            try func.genSetReg(Type.u64, .ra, .{ .lea_symbol = .{ .sym = sym_index } });
             _ = try func.addInst(.{
                 .tag = .jalr,
                 .data = .{ .i_type = .{
@@ -7990,8 +8051,50 @@ fn airErrorName(func: *Func, inst: Air.Inst.Index) !void {
 }
 
 fn airSplat(func: *Func, inst: Air.Inst.Index) !void {
+    const pt = func.pt;
+    const zcu = pt.zcu;
     const ty_op = func.air.instructions.items(.data)[@intFromEnum(inst)].ty_op;
-    const result: MCValue = if (func.liveness.isUnused(inst)) .unreach else return func.fail("TODO implement airSplat for riscv64", .{});
+    const result: MCValue = if (func.liveness.isUnused(inst)) .unreach else result: {
+        const vector_ty = func.typeOfIndex(inst);
+        const vector_len = vector_ty.vectorLen(zcu);
+        const scalar_ty = func.typeOf(ty_op.operand);
+        const src_mcv = try func.resolveInst(ty_op.operand);
+
+        const dst_reg, const dst_lock = try func.allocReg(.vector);
+        const src_reg, const src_lock = try func.promoteReg(scalar_ty, src_mcv);
+        defer if (src_lock) |lock| func.register_manager.unlockReg(lock);
+        defer func.register_manager.unlockReg(dst_lock);
+
+        switch (scalar_ty.zigTypeTag(zcu)) {
+            .int => {
+                switch (scalar_ty.intInfo(zcu).bits) {
+                    8, 16, 32, 64 => |b| {
+                        const vsew = bits.VSew.fromBits(b) orelse unreachable;
+
+                        try func.setVl(.zero, vector_len, .{
+                            .vlmul = .m1,
+                            .vsew = vsew,
+                            .vma = true,
+                            .vta = true,
+                        });
+
+                        _ = try func.addInst(.{
+                            .tag = .vmvvx,
+                            .data = .{ .r_type = .{
+                                .rd = dst_reg,
+                                .rs1 = src_reg,
+                                .rs2 = .zero,
+                            } },
+                        });
+                    },
+                    else => |b| return func.fail("TODO: implement airSplat for Int {d}", .{b}),
+                }
+            },
+            else => return func.fail("TODO implement airSplat for {}", .{vector_ty.fmt(pt)}),
+        }
+
+        break :result .{ .register = dst_reg };
+    };
     return func.finishAir(inst, result, .{ ty_op.operand, .none, .none });
 }
 
@@ -8009,8 +8112,76 @@ fn airShuffle(func: *Func, inst: Air.Inst.Index) !void {
 }
 
 fn airReduce(func: *Func, inst: Air.Inst.Index) !void {
+    const pt = func.pt;
+    const zcu = pt.zcu;
+
     const reduce = func.air.instructions.items(.data)[@intFromEnum(inst)].reduce;
-    const result: MCValue = if (func.liveness.isUnused(inst)) .unreach else return func.fail("TODO implement airReduce for riscv64", .{});
+    const result: MCValue = if (func.liveness.isUnused(inst)) .unreach else result: {
+        const operand_ty = func.typeOf(reduce.operand);
+        const operand = try func.resolveInst(reduce.operand);
+        const elem_ty = operand_ty.childType(zcu);
+
+        if (!elem_ty.isInt(zcu)) {
+            return func.fail("TODO: airReduce {}", .{operand_ty.fmt(pt)});
+        }
+
+        const dst_mcv = try func.allocRegOrMem(elem_ty, inst, true);
+
+        const src_reg, const src_locks = if (operand == .register and operand.register.class() == .vector)
+            .{ operand.register, null }
+        else blk: {
+            const src_reg, const src_locks = try func.allocVecReg(operand_ty);
+            try func.genCopy(operand_ty, .{ .register = src_reg }, operand);
+            break :blk .{ src_reg, src_locks };
+        };
+        defer {
+            if (src_locks) |locks| {
+                for (locks) |lock| func.register_manager.unlockReg(lock);
+                func.gpa.free(locks);
+            }
+        }
+
+        const mask_reg, const mask_lock = try func.allocReg(.vector);
+        defer func.register_manager.unlockReg(mask_lock);
+
+        try func.setVl(.zero, operand_ty.vectorLen(zcu), .{
+            .vlmul = try func.suggestedVlMul(operand_ty),
+            .vsew = bits.VSew.fromBits(elem_ty.bitSize(zcu)) orelse
+                return func.fail("TODO: airReduce elem_ty size {}", .{elem_ty.bitSize(zcu)}),
+            .vma = true,
+            .vta = true,
+        });
+
+        // TODO: optimize this to use vmv.s.x instead of a full-lane move
+        try func.genSetReg(operand_ty, mask_reg, .{ .register = .zero });
+
+        const operation: std.builtin.ReduceOp = reduce.operation;
+        _ = try func.addInst(.{
+            .tag = switch (operation) {
+                // zig fmt: off
+                .Add => .vredsumvs,
+                .And => .vredandvs,
+                .Max => if (elem_ty.isUnsignedInt(zcu)) .vredmaxuvs else .vredmaxvs,
+                .Min => if (elem_ty.isUnsignedInt(zcu)) .vredminuvs else .vredminvs,
+                .Or  => .vredorvs,
+                .Xor => .vredxorvs,
+                .Mul => return func.fail("TODO: airReduce Mul", .{}),
+                // zig fmt: on
+            },
+            .data = .{ .r_type = .{
+                .rd = mask_reg,
+                .rs1 = switch (operation) {
+                    .Add => mask_reg,
+                    else => src_reg,
+                },
+                .rs2 = src_reg,
+            } },
+        });
+
+        try func.genCopy(operand_ty, dst_mcv, .{ .register = mask_reg });
+
+        break :result dst_mcv;
+    };
     return func.finishAir(inst, result, .{ reduce.operand, .none, .none });
 }
 
@@ -8185,12 +8356,16 @@ fn genTypedValue(func: *Func, val: Value) InnerError!MCValue {
         .mcv => |mcv| switch (mcv) {
             .none => .none,
             .undef => unreachable,
-            .lea_symbol => |sym_index| .{ .lea_symbol = .{ .sym = sym_index } },
             .load_symbol => |sym_index| .{ .load_symbol = .{ .sym = sym_index } },
+            .lea_symbol => |sym_index| .{ .lea_symbol = .{ .sym = sym_index } },
             .load_tlv => |sym_index| .{ .lea_tlv = sym_index },
             .immediate => |imm| .{ .immediate = imm },
             .memory => |addr| .{ .memory = addr },
-            .load_got, .load_direct, .lea_direct => {
+
+            .load_got,
+            .load_direct,
+            .lea_direct,
+            => {
                 return func.fail("TODO: genTypedValue {s}", .{@tagName(mcv)});
             },
         },
@@ -8216,10 +8391,13 @@ fn resolveCallingConventionValues(
     func: *Func,
     fn_info: InternPool.Key.FuncType,
     var_args: []const Type,
+    stack_frame_base: FrameIndex,
 ) !CallMCValues {
     const pt = func.pt;
     const zcu = pt.zcu;
     const ip = &zcu.intern_pool;
+
+    _ = stack_frame_base;
 
     const param_types = try func.gpa.alloc(Type, fn_info.param_types.len + var_args.len);
     defer func.gpa.free(param_types);
@@ -8256,7 +8434,7 @@ fn resolveCallingConventionValues(
             var ret_int_reg_i: u32 = 0;
             var param_int_reg_i: u32 = 0;
 
-            result.stack_align = .@"16";
+            result.stack_align = .fromByteUnits(16);
 
             // Return values
             if (ret_ty.zigTypeTag(zcu) == .noreturn) {
@@ -8268,7 +8446,7 @@ fn resolveCallingConventionValues(
                 var ret_tracking_i: usize = 0;
                 var ret_float_reg_i: usize = 0;
 
-                const classes = mem.sliceTo(&abi.classifySystem(ret_ty, zcu), .none);
+                const classes = mem.sliceTo(&abi.classifyCallingConvention(ret_ty, zcu), .none);
 
                 for (classes) |class| switch (class) {
                     .integer => {
@@ -8321,7 +8499,7 @@ fn resolveCallingConventionValues(
                 var arg_mcv: [2]MCValue = undefined;
                 var arg_mcv_i: usize = 0;
 
-                const classes = mem.sliceTo(&abi.classifySystem(ty, zcu), .none);
+                const classes = mem.sliceTo(&abi.classifyCallingConvention(ty, zcu), .none);
 
                 for (classes) |class| switch (class) {
                     .integer => {
@@ -8366,6 +8544,51 @@ fn resolveCallingConventionValues(
                 return func.fail("TODO: pass args by stack", .{});
             }
         },
+        // TODO: switch the `auto` over to using the memory arguments, needed for support of
+        // more complex Zig types.
+        //  => {
+        //     result.stack_align = .@"16";
+
+        //     // Return values
+        //     if (ret_ty.zigTypeTag(zcu) == .noreturn) {
+        //         result.return_value = InstTracking.init(.unreach);
+        //     } else if (!ret_ty.hasRuntimeBitsIgnoreComptime(zcu)) {
+        //         result.return_value = InstTracking.init(.none);
+        //     } else {
+        //         const ret_reg = abi.Registers.Integer.function_ret_regs[0];
+        //         const ret_ty_size: u31 = @intCast(ret_ty.abiSize(zcu));
+        //         if (ret_ty_size <= 8 and !ret_ty.isRuntimeFloat()) {
+        //             result.return_value = .{ .short = .{ .register = ret_reg }, .long = .none };
+        //         } else {
+        //             const ret_indirect_reg = abi.Registers.Integer.function_arg_regs[0];
+        //             result.return_value = .{
+        //                 .short = .{ .indirect = .{ .reg = ret_reg } },
+        //                 .long = .{ .indirect = .{ .reg = ret_indirect_reg } },
+        //             };
+        //         }
+        //     }
+
+        //     // Input params
+        //     for (param_types, result.args) |ty, *arg| {
+        //         if (!ty.hasRuntimeBitsIgnoreComptime(zcu)) {
+        //             arg.* = .none;
+        //             continue;
+        //         }
+        //         const param_size: u31 = @intCast(ty.abiSize(zcu));
+        //         const param_align = ty.abiAlignment(zcu);
+        //         result.stack_byte_count = mem.alignForward(
+        //             u31,
+        //             result.stack_byte_count,
+        //             @intCast(param_align.toByteUnits().?),
+        //         );
+        //         result.stack_align = result.stack_align.max(param_align);
+        //         arg.* = .{ .load_frame = .{
+        //             .index = stack_frame_base,
+        //             .off = result.stack_byte_count,
+        //         } };
+        //         result.stack_byte_count += param_size;
+        //     }
+        // },
         else => return func.fail("TODO implement function parameters for {} on riscv64", .{cc}),
     }
 
@@ -8424,6 +8647,49 @@ fn typeOfIndex(func: *Func, inst: Air.Inst.Index) Type {
 
 fn hasFeature(func: *Func, feature: Target.riscv.Feature) bool {
     return Target.riscv.featureSetHas(func.target.cpu.features, feature);
+}
+
+fn vectorBits(func: *Func) u32 {
+    var vec_bit_length: u32 = 256;
+    inline for (.{
+        .zvl32b,
+        .zvl64b,
+        .zvl128b,
+        .zvl256b,
+        .zvl512b,
+        .zvl1024b,
+        .zvl2048b,
+        .zvl4096b,
+        .zvl8192b,
+        .zvl16384b,
+        .zvl32768b,
+        .zvl65536b,
+    }) |feat| {
+        if (std.Target.riscv.featureSetHas(func.target.cpu.features, feat)) {
+            const name = @tagName(feat);
+            vec_bit_length = std.fmt.parseInt(u32, name[3 .. name.len - 1], 10) catch unreachable;
+        }
+    }
+    return vec_bit_length;
+}
+
+fn suggestedVlMul(func: *Func, ty: Type) !bits.VlMul {
+    const zcu = func.pt.zcu;
+    assert(ty.isVector(zcu)); // pass in the vector type
+
+    const vb = func.vectorBits();
+    const ty_bits = ty.bitSize(zcu);
+
+    const regs = math.divCeil(u32, @intCast(ty_bits), vb) catch unreachable;
+    const mul = try math.ceilPowerOfTwo(u32, regs);
+
+    return switch (mul) {
+        1 => .m1,
+        2 => .m2,
+        4 => .m4,
+        8 => .m8,
+        else => return func.fail("suggestedVlMul mul {d}", .{mul}),
+    };
 }
 
 pub fn errUnionPayloadOffset(payload_ty: Type, zcu: *Zcu) u64 {

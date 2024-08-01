@@ -97,7 +97,7 @@ pub const SystemClass = enum { integer, float, memory, none };
 
 /// There are a maximum of 8 possible return slots. Returned values are in
 /// the beginning of the array; unused slots are filled with .none.
-pub fn classifySystem(ty: Type, zcu: *Zcu) [8]SystemClass {
+pub fn classifyCallingConvention(ty: Type, zcu: *Zcu) [8]SystemClass {
     var result = [1]SystemClass{.none} ** 8;
     const memory_class = [_]SystemClass{
         .memory, .none, .none, .none,
@@ -200,7 +200,7 @@ pub fn classifySystem(ty: Type, zcu: *Zcu) [8]SystemClass {
             // but we haven't implemented seperating vector registers into register_pairs
             return memory_class;
         },
-        else => |bad_ty| std.debug.panic("classifySystem {s}", .{@tagName(bad_ty)}),
+        else => |bad_ty| std.debug.panic("classifyCallingConvention {s}", .{@tagName(bad_ty)}),
     }
 }
 
@@ -227,7 +227,7 @@ fn classifyStruct(
                 continue;
             }
         }
-        const field_class = std.mem.sliceTo(&classifySystem(field_ty, zcu), .none);
+        const field_class = std.mem.sliceTo(&classifyCallingConvention(field_ty, zcu), .none);
         const field_size = field_ty.abiSize(zcu);
 
         combine: {
@@ -297,7 +297,9 @@ pub const Registers = struct {
         };
 
         pub const temporary_regs = [_]Register{
-            .t0, .t1, .t2, .t3, .t4, .t5, .t6,
+            // .t6 is omitted to be used internally as a scratch register
+            // to simplify some patterns.
+            .t0, .t1, .t2, .t3, .t4, .t5,
         };
 
         pub const all_regs = callee_preserved_regs ++ function_arg_regs ++ temporary_regs;

@@ -146,7 +146,8 @@ pub const Register = enum(u8) {
     a0, a1, // fn args/return values. caller saved.
     a2, a3, a4, a5, a6, a7, // fn args. caller saved.
     s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, // saved registers. callee saved.
-    t3, t4, t5, t6, // caller saved
+    t3, t4, t5, // caller saved
+    scratch, // caller saved - used internally in our codegen
 
     x0,  x1,  x2,  x3,  x4,  x5,  x6,  x7,
     x8,  x9,  x10, x11, x12, x13, x14, x15,
@@ -291,14 +292,24 @@ pub const VType = packed struct(u8) {
     vma: bool,
 };
 
-const VSew = enum(u3) {
+pub const VSew = enum(u3) {
     @"8" = 0b000,
     @"16" = 0b001,
     @"32" = 0b010,
     @"64" = 0b011,
+
+    pub fn fromBits(bits: u64) ?VSew {
+        return switch (bits) {
+            8 => .@"8",
+            16 => .@"16",
+            32 => .@"32",
+            64 => .@"64",
+            else => null,
+        };
+    }
 };
 
-const VlMul = enum(u3) {
+pub const VlMul = enum(u3) {
     mf8 = 0b101,
     mf4 = 0b110,
     mf2 = 0b111,

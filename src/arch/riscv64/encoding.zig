@@ -365,7 +365,11 @@ pub const Lir = struct {
             .ecall   => .{ .opcode = .SYSTEM, .format = .extra, .data = .{ .extra = .ecall  } },
             .ebreak  => .{ .opcode = .SYSTEM, .format = .extra, .data = .{ .extra = .ebreak } },
 
-            .csrrs   => .{ .opcode = .SYSTEM, .format = .I, .data = .{ .f = .{ .funct3 = 0b010 } } },
+            .sret   => .{ .opcode = .SYSTEM, .format = .extra, .data = .{ .extra = .sret  } },
+            .@"sfence.vma"   => .{ .opcode = .SYSTEM, .format = .extra, .data = .{ .extra = .@"sfence.vma"  } },
+
+            .csrrs   => .{ .opcode = .SYSTEM, .format = .I, .data = .{ .f = .{ .funct3 = 0b001 } } },
+            .csrrw   => .{ .opcode = .SYSTEM, .format = .I, .data = .{ .f = .{ .funct3 = 0b010 } } },
            
 
             // NONE
@@ -708,20 +712,39 @@ pub const Instruction = union(Lir.Format) {
             },
             .extra => {
                 assert(ops.len == 0);
-
-                return .{
-                    .I = .{
-                        .rd = Register.zero.encodeId(),
-                        .rs1 = Register.zero.encodeId(),
-                        .imm0_11 = switch (lir.data.extra) {
-                            .ecall => 0x000,
-                            .ebreak => 0x001,
-                            .unimp => 0x000,
-                            else => unreachable,
+                return switch (lir.data.extra) {
+                    .sret => .{
+                        .R = .{
+                            .opcode = opcode,
+                            .rd = 0b0,
+                            .funct3 = 0b0,
+                            .rs1 = 0b0,
+                            .rs2 = 0b00010,
+                            .funct7 = 0b0001000,
                         },
-
+                    },
+                    .@"sfence.vma" => .{ .R = .{
                         .opcode = opcode,
-                        .funct3 = 0b000,
+                        .rd = 0b0,
+                        .funct3 = 0b0,
+                        .rs1 = Register.zero.encodeId(),
+                        .rs2 = Register.zero.encodeId(),
+                        .funct7 = 0b0001001,
+                    } },
+                    else => .{
+                        .I = .{
+                            .rd = Register.zero.encodeId(),
+                            .rs1 = Register.zero.encodeId(),
+                            .imm0_11 = switch (lir.data.extra) {
+                                .ecall => 0x000,
+                                .ebreak => 0x001,
+                                .unimp => 0x000,
+                                else => unreachable,
+                            },
+
+                            .opcode = opcode,
+                            .funct3 = 0b000,
+                        },
                     },
                 };
             },

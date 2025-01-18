@@ -56,6 +56,8 @@ shdr_table_offset: ?u64 = null,
 /// Same order as in the file.
 phdrs: ProgramHeaderList = .empty,
 
+phdr_table: ?elf.Elf64_Phdr = null,
+
 /// Special program headers.
 phdr_indexes: ProgramHeaderIndexes = .{},
 section_indexes: SectionIndexes = .{},
@@ -174,12 +176,12 @@ const ProgramHeaderIndex = enum(u16) {
 };
 
 const ProgramHeaderIndexes = struct {
-    /// PT_PHDR
-    table: OptionalProgramHeaderIndex = .none,
-    /// PT_LOAD for PHDR table
-    /// We add this special load segment to ensure the EHDR and PHDR table are always
-    /// loaded into memory.
-    table_load: OptionalProgramHeaderIndex = .none,
+    // /// PT_PHDR
+    // table: OptionalProgramHeaderIndex = .none,
+    // /// PT_LOAD for PHDR table
+    // /// We add this special load segment to ensure the EHDR and PHDR table are always
+    // /// loaded into memory.
+    // table_load: OptionalProgramHeaderIndex = .none,
     /// PT_INTERP
     interp: OptionalProgramHeaderIndex = .none,
     /// PT_DYNAMIC
@@ -400,24 +402,34 @@ pub fn createEmpty(
         };
         const max_nphdrs = comptime getMaxNumberOfPhdrs();
         const reserved: u64 = mem.alignForward(u64, padToIdeal(max_nphdrs * phsize), self.page_size);
-        self.phdr_indexes.table = (try self.addPhdr(.{
-            .type = elf.PT_PHDR,
-            .flags = elf.PF_R,
-            .@"align" = p_align,
-            .addr = self.image_base + ehsize,
-            .offset = ehsize,
-            .filesz = reserved,
-            .memsz = reserved,
-        })).toOptional();
-        self.phdr_indexes.table_load = (try self.addPhdr(.{
-            .type = elf.PT_LOAD,
-            .flags = elf.PF_R,
-            .@"align" = self.page_size,
-            .addr = self.image_base,
-            .offset = 0,
-            .filesz = reserved + ehsize,
-            .memsz = reserved + ehsize,
-        })).toOptional();
+        self.phdr_table = .{
+            .p_type = elf.PT_PHDR,
+            .p_flags = elf.PF_R,
+            .p_align = p_align,
+            .p_paddr = self.image_base + ehsize,
+            .p_vaddr = self.image_base + ehsize,
+            .p_offset = ehsize,
+            .p_filesz = reserved,
+            .p_memsz = reserved,
+        };
+        // self.phdr_indexes.table = (try self.addPhdr(.{
+        //     .type = elf.PT_PHDR,
+        //     .flags = elf.PF_R,
+        //     .@"align" = p_align,
+        //     .addr = self.image_base + ehsize,
+        //     .offset = ehsize,
+        //     .filesz = reserved,
+        //     .memsz = reserved,
+        // })).toOptional();
+        // self.phdr_indexes.table_load = (try self.addPhdr(.{
+        //     .type = elf.PT_LOAD,
+        //     .flags = elf.PF_R,
+        //     .@"align" = self.page_size,
+        //     .addr = self.image_base,
+        //     .offset = 0,
+        //     .filesz = reserved + ehsize,
+        //     .memsz = reserved + ehsize,
+        // })).toOptional();
     }
 
     if (opt_zcu) |zcu| {
@@ -540,6 +552,12 @@ fn detectAllocCollision(self: *Elf, start: u64, size: u64) !?u64 {
     const ehdr_size: u64 = if (small_ptr) @sizeOf(elf.Elf32_Ehdr) else @sizeOf(elf.Elf64_Ehdr);
     if (start < ehdr_size)
         return ehdr_size;
+    const phsize: u64 = switch (self.ptr_width) {
+        .p32 => @sizeOf(elf.Elf32_Phdr),
+        .p64 => @sizeOf(elf.Elf64_Phdr),
+    };
+    const needed_size = getMaxNumberOfPhdrs() * phsize;
+    if (start < self.phdr_table.?.p_offset + needed_size) return self.phdr_table.?.p_offset + needed_size;
 
     var at_end = true;
     const end = start + padToIdeal(size);
@@ -829,7 +847,12 @@ pub fn flushModule(self: *Elf, arena: Allocator, tid: Zcu.PerThread.Id, prog_nod
     return flushModuleInner(self, arena, tid) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.LinkFailure => return error.LinkFailure,
-        else => |e| return diags.fail("ELF flush failed: {s}", .{@errorName(e)}),
+        else => |e| {
+            if (@errorReturnTrace()) |ret| {
+                std.debug.dumpStackTrace(ret.*);
+            }
+            return diags.fail("ELF flush failed: {s}", .{@errorName(e)});
+        },
     };
 }
 
@@ -2156,7 +2179,7 @@ fn writePhdrTable(self: *Elf) !void {
     const gpa = self.base.comp.gpa;
     const target_endian = self.getTarget().cpu.arch.endian();
     const foreign_endian = target_endian != builtin.cpu.arch.endian();
-    const phdr_table = &self.phdrs.items[self.phdr_indexes.table.int().?];
+    const phdr_table = &self.phdr_table.?;
 
     log.debug("writing program headers from 0x{x} to 0x{x}", .{
         phdr_table.p_offset,
@@ -2182,6 +2205,7 @@ fn writePhdrTable(self: *Elf) !void {
 
             for (buf, 0..) |*phdr, i| {
                 phdr.* = self.phdrs.items[i];
+                log.err("{}", .{phdr});
                 if (foreign_endian) {
                     mem.byteSwapAllFields(elf.Elf64_Phdr, phdr);
                 }
@@ -2269,7 +2293,7 @@ pub fn writeElfHeader(self: *Elf) !void {
         const entry_sym = obj.entrySymbol(self) orelse break :blk 0;
         break :blk @intCast(entry_sym.address(.{}, self));
     } else 0;
-    const phdr_table_offset = if (self.phdr_indexes.table.int()) |phndx| self.phdrs.items[phndx].p_offset else 0;
+    const phdr_table_offset = if (self.phdr_table) |phdr_table| phdr_table.p_offset else 0;
     switch (self.ptr_width) {
         .p32 => {
             mem.writeInt(u32, hdr_buf[index..][0..4], @intCast(e_entry), endian);
@@ -3372,13 +3396,13 @@ fn addLoadPhdrs(self: *Elf) error{OutOfMemory}!void {
 /// Allocates PHDR table in virtual memory and in file.
 fn allocatePhdrTable(self: *Elf) error{OutOfMemory}!void {
     const diags = &self.base.comp.link_diags;
-    const phdr_table = &self.phdrs.items[self.phdr_indexes.table.int().?];
-    const phdr_table_load = &self.phdrs.items[self.phdr_indexes.table_load.int().?];
+    const phdr_table = &self.phdr_table.?;
+    // const phdr_table_load = &self.phdrs.items[self.phdr_indexes.table_load.int().?];
 
-    const ehsize: u64 = switch (self.ptr_width) {
-        .p32 => @sizeOf(elf.Elf32_Ehdr),
-        .p64 => @sizeOf(elf.Elf64_Ehdr),
-    };
+    // const ehsize: u64 = switch (self.ptr_width) {
+    //     .p32 => @sizeOf(elf.Elf32_Ehdr),
+    //     .p64 => @sizeOf(elf.Elf64_Ehdr),
+    // };
     const phsize: u64 = switch (self.ptr_width) {
         .p32 => @sizeOf(elf.Elf32_Phdr),
         .p64 => @sizeOf(elf.Elf64_Phdr),
@@ -3397,8 +3421,8 @@ fn allocatePhdrTable(self: *Elf) error{OutOfMemory}!void {
         err.addNote("required 0x{x}, available 0x{x}", .{ needed_size, available_space });
     }
 
-    phdr_table_load.p_filesz = needed_size + ehsize;
-    phdr_table_load.p_memsz = needed_size + ehsize;
+    // phdr_table_load.p_filesz = needed_size + ehsize;
+    // phdr_table_load.p_memsz = needed_size + ehsize;
     phdr_table.p_filesz = needed_size;
     phdr_table.p_memsz = needed_size;
 }
@@ -3465,8 +3489,8 @@ pub fn allocateAllocSections(self: *Elf) !void {
     // When allocating we first find the largest required alignment
     // of any section that is contained in a cover and use it to align
     // the start address of the segement (and first section).
-    const phdr_table = &self.phdrs.items[self.phdr_indexes.table_load.int().?];
-    var addr = phdr_table.p_vaddr + phdr_table.p_memsz;
+    // const phdr_table = &self.phdrs.items[self.phdr_indexes.table_load.int().?];
+    var addr = self.image_base;
 
     for (covers) |cover| {
         if (cover.items.len == 0) continue;
@@ -4195,9 +4219,9 @@ fn getPhdr(self: *Elf, opts: struct {
     flags: u32 = 0,
 }) OptionalProgramHeaderIndex {
     for (self.phdrs.items, 0..) |phdr, phndx| {
-        if (self.phdr_indexes.table_load.int()) |index| {
-            if (phndx == index) continue;
-        }
+        // if (self.phdr_indexes.table_load.int()) |index| {
+        //     if (phndx == index) continue;
+        // }
         if (phdr.p_type == opts.type and phdr.p_flags == opts.flags)
             return @enumFromInt(phndx);
     }

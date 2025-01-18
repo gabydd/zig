@@ -128,6 +128,7 @@ pub const CSR = enum(u12) {
     vl = 0xC20,
     vtype = 0xC21,
     vlenb = 0xC22,
+    _,
 };
 
 pub const Register = enum(u8) {

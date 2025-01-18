@@ -65,6 +65,8 @@ pub const Mnemonic = enum(u16) {
     ecall,
     unimp,
     nop,
+    sret,
+    @"sfence.vma",
 
     // M extension
     mul,
@@ -147,6 +149,7 @@ pub const Mnemonic = enum(u16) {
 
     // Zicsr Extension Instructions
     csrrs,
+    csrrw,
 
     // V Extension Instructions
     vsetvli,
@@ -270,4 +273,6 @@ pub const Pseudo = enum(u8) {
     tail,
     beqz,
     ret,
+    csrw,
+    csrr,
 };

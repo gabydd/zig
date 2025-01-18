@@ -81,7 +81,7 @@ pub fn init(self: *ZigObject, elf_file: *Elf, options: InitOptions) !void {
     _ = options;
     const comp = elf_file.base.comp;
     const gpa = comp.gpa;
-    const ptr_size = elf_file.ptrWidthBytes();
+    // const ptr_size = elf_file.ptrWidthBytes();
 
     try self.atoms.append(gpa, .{ .extra_index = try self.addAtomExtra(gpa, .{}) }); // null input section
     try self.relocs.append(gpa, .{}); // null relocs section
@@ -207,19 +207,19 @@ pub fn init(self: *ZigObject, elf_file: *Elf, options: InitOptions) !void {
                 self.debug_rnglists_index = try addSectionSymbolWithAtom(self, gpa, ".debug_rnglists", .@"1", osec);
             }
 
-            if (self.eh_frame_index == null) {
-                const osec = try elf_file.addSection(.{
-                    .name = try elf_file.insertShString(".eh_frame"),
-                    .type = if (elf_file.getTarget().cpu.arch == .x86_64)
-                        elf.SHT_X86_64_UNWIND
-                    else
-                        elf.SHT_PROGBITS,
-                    .flags = elf.SHF_ALLOC,
-                    .addralign = ptr_size,
-                });
-                self.eh_frame_section_dirty = true;
-                self.eh_frame_index = try addSectionSymbolWithAtom(self, gpa, ".eh_frame", Atom.Alignment.fromNonzeroByteUnits(ptr_size), osec);
-            }
+            // if (self.eh_frame_index == null) {
+            //     const osec = try elf_file.addSection(.{
+            //         .name = try elf_file.insertShString(".eh_frame"),
+            //         .type = if (elf_file.getTarget().cpu.arch == .x86_64)
+            //             elf.SHT_X86_64_UNWIND
+            //         else
+            //             elf.SHT_PROGBITS,
+            //         .flags = elf.SHF_ALLOC,
+            //         .addralign = ptr_size,
+            //     });
+            //     self.eh_frame_section_dirty = true;
+            //     self.eh_frame_index = try addSectionSymbolWithAtom(self, gpa, ".eh_frame", Atom.Alignment.fromNonzeroByteUnits(ptr_size), osec);
+            // }
 
             try dwarf.initMetadata();
             self.dwarf = dwarf;
@@ -326,7 +326,7 @@ pub fn flush(self: *ZigObject, elf_file: *Elf, tid: Zcu.PerThread.Id) !void {
             self.debug_line_str_index.?,
             self.debug_loclists_index.?,
             self.debug_rnglists_index.?,
-            self.eh_frame_index.?,
+            // self.eh_frame_index.?,
         }, [_]*Dwarf.Section{
             &dwarf.debug_info.section,
             &dwarf.debug_abbrev.section,
@@ -336,7 +336,7 @@ pub fn flush(self: *ZigObject, elf_file: *Elf, tid: Zcu.PerThread.Id) !void {
             &dwarf.debug_line_str.section,
             &dwarf.debug_loclists.section,
             &dwarf.debug_rnglists.section,
-            &dwarf.debug_frame.section,
+            // &dwarf.debug_frame.section,
         }, [_]Dwarf.Section.Index{
             .debug_info,
             .debug_abbrev,
@@ -346,7 +346,7 @@ pub fn flush(self: *ZigObject, elf_file: *Elf, tid: Zcu.PerThread.Id) !void {
             .debug_line_str,
             .debug_loclists,
             .debug_rnglists,
-            .debug_frame,
+            // .debug_frame,
         }) |sym_index, sect, sect_index| {
             const sym = self.symbol(sym_index);
             const atom_ptr = self.atom(sym.ref.index).?;

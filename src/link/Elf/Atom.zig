@@ -652,7 +652,9 @@ pub fn resolveRelocsAlloc(self: Atom, elf_file: *Elf, code: []u8) RelocError!voi
         // Address of the dynamic thread pointer.
         const DTP = elf_file.dtpAddress();
 
-        relocs_log.debug("  {s}: {x}: [{x} => {x}] GOT({x}) ({s})", .{
+        relocs_log.debug("  S {x} A {x} {s}: {x}: [{x} => {x}] GOT({x}) ({s})", .{
+            S,
+            A,
             relocation.fmtRelocType(rel.r_type(), cpu_arch),
             r_offset,
             P,
@@ -1926,7 +1928,7 @@ const riscv = struct {
             .SUB32 => riscv_util.writeAddend(i32, .sub, code[r_offset..][0..4], S + A),
 
             .HI20 => {
-                const value: u32 = @bitCast(math.cast(i32, S + A) orelse return error.Overflow);
+                const value: u32 = @intCast((S + A) & 0xFFFFF000);
                 riscv_util.writeInstU(code[r_offset..][0..4], value);
             },
 
@@ -1992,7 +1994,7 @@ const riscv = struct {
             .LO12_I,
             .LO12_S,
             => {
-                const disp: u32 = @bitCast(math.cast(i32, S + A) orelse return error.Overflow);
+                const disp: u32 = @bitCast(math.cast(i32, (S + A) & 0x00000FFF) orelse return error.Overflow);
                 switch (r_type) {
                     .LO12_I => riscv_util.writeInstI(code[r_offset..][0..4], disp),
                     .LO12_S => riscv_util.writeInstS(code[r_offset..][0..4], disp),

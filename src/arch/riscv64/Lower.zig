@@ -303,7 +303,25 @@ pub fn lowerMir(lower: *Lower, index: Mir.Inst.Index, options: struct {
         .pseudo_load_symbol => {
             const payload = inst.data.reloc;
             const dst_reg = payload.register;
+            const scratch = bits.Register.scratch;
             assert(dst_reg.class() == .int);
+            _ = try lower.emit(.addi, &.{
+                .{ .reg = scratch },
+                .{ .reg = bits.Register.zero },
+                .{ .imm = Immediate.s(1) },
+            });
+
+            _ = try lower.emit(.slli, &.{
+                .{ .reg = scratch },
+                .{ .reg = scratch },
+                .{ .imm = Immediate.s(12) },
+            });
+
+            _ = try lower.emit(.addi, &.{
+                .{ .reg = scratch },
+                .{ .reg = scratch },
+                .{ .imm = Immediate.s(-1) },
+            });
 
             try lower.emit(.lui, &.{
                 .{ .reg = dst_reg },
@@ -316,10 +334,40 @@ pub fn lowerMir(lower: *Lower, index: Mir.Inst.Index, options: struct {
             });
 
             // the reloc above implies this one
-            try lower.emit(.addi, &.{
-                .{ .reg = dst_reg },
-                .{ .reg = dst_reg },
+            try lower.emit(.andi, &.{
+                .{ .reg = scratch },
+                .{ .reg = scratch },
                 .{ .imm = Immediate.s(0) },
+            });
+
+            try lower.emit(.add, &.{
+                .{ .reg = dst_reg },
+                .{ .reg = dst_reg },
+                .{ .reg = scratch },
+            });
+
+            _ = try lower.emit(.addi, &.{
+                .{ .reg = scratch },
+                .{ .reg = bits.Register.zero },
+                .{ .imm = Immediate.s(2) },
+            });
+
+            _ = try lower.emit(.slli, &.{
+                .{ .reg = scratch },
+                .{ .reg = scratch },
+                .{ .imm = Immediate.s(31) },
+            });
+
+            _ = try lower.emit(.addi, &.{
+                .{ .reg = scratch },
+                .{ .reg = scratch },
+                .{ .imm = Immediate.s(-1) },
+            });
+
+            _ = try lower.emit(.@"and", &.{
+                .{ .reg = dst_reg },
+                .{ .reg = dst_reg },
+                .{ .reg = scratch },
             });
         },
 

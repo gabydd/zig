@@ -2203,7 +2203,7 @@ pub fn initMetadata(dwarf: *Dwarf) UpdateError!void {
         for ([_]*Section{
             &dwarf.debug_abbrev.section,
             &dwarf.debug_aranges.section,
-            &dwarf.debug_frame.section,
+            // &dwarf.debug_frame.section,
             &dwarf.debug_info.section,
             &dwarf.debug_line.section,
             &dwarf.debug_line_str.section,
@@ -2213,7 +2213,7 @@ pub fn initMetadata(dwarf: *Dwarf) UpdateError!void {
         }, [_]u32{
             zo.debug_abbrev_index.?,
             zo.debug_aranges_index.?,
-            zo.eh_frame_index.?,
+            // zo.eh_frame_index.?,
             zo.debug_info_index.?,
             zo.debug_line_index.?,
             zo.debug_line_str_index.?,

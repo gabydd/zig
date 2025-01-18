@@ -4588,9 +4588,120 @@ fn airStore(func: *Func, inst: Air.Inst.Index, safety: bool) !void {
     const value = try func.resolveInst(bin_op.rhs);
     const ptr_ty = func.typeOf(bin_op.lhs);
 
-    try func.store(ptr, value, ptr_ty);
+    const ptr_info = ptr_ty.ptrInfo(func.pt.zcu);
+    if (ptr_info.flags.vector_index != .none or ptr_info.packed_offset.host_size > 0) {
+        try func.packedStore(ptr, value, ptr_ty);
+    } else {
+        try func.store(ptr, value, ptr_ty);
+    }
 
     return func.finishAir(inst, .none, .{ bin_op.lhs, bin_op.rhs, .none });
+}
+
+fn packedStore(func: *Func, ptr_mcv: MCValue, src_mcv: MCValue, ptr_ty: Type) !void {
+    const zcu = func.pt.zcu;
+    const ptr_info = ptr_ty.ptrInfo(zcu);
+    const src_ty: Type = .fromInterned(ptr_info.child);
+    log.debug(
+        "storing packed {}:{} in {}:{}",
+        .{ src_mcv.fmt(), src_ty.fmt(func.pt), ptr_mcv.fmt(), ptr_ty.fmt(func.pt) },
+    );
+    const deref_mcv = b: switch (ptr_mcv) {
+        .none => unreachable,
+        .undef => unreachable,
+        .unreach => unreachable,
+        .dead => unreachable,
+        .register_pair => unreachable,
+        .reserved_frame => unreachable,
+        .air_ref => unreachable,
+
+        .immediate,
+        .register,
+        .register_offset,
+        .lea_symbol,
+        .lea_frame,
+        .lea_tlv,
+        => ptr_mcv.deref(),
+
+        .memory,
+        .indirect,
+        .load_symbol,
+        .load_frame,
+        .load_tlv,
+        => {
+            const addr_reg = try func.copyToTmpRegister(ptr_ty, ptr_mcv);
+            const addr_lock = func.register_manager.lockRegAssumeUnused(addr_reg);
+            defer func.register_manager.unlockReg(addr_lock);
+            break :b MCValue{ .indirect = .{ .reg = addr_reg } };
+        },
+    };
+
+    const dst_reg, const dst_lock = try func.allocReg(func.typeRegClass(src_ty));
+    defer func.register_manager.unlockReg(dst_lock);
+
+    const dst_mcv = MCValue{ .register = dst_reg };
+    try func.genSetReg(Type.u64, dst_reg, deref_mcv);
+
+    const value_reg, const value_lock = try func.allocReg(func.typeRegClass(src_ty));
+    defer func.register_manager.unlockReg(value_lock);
+
+    _ = try func.addInst(.{
+        .tag = .addi,
+        .data = .{ .i_type = .{
+            .rd = value_reg,
+            .rs1 = .zero,
+            .imm12 = Immediate.s(-1),
+        } },
+    });
+    try func.truncateRegister(src_ty, value_reg);
+
+    _ = try func.addInst(.{
+        .tag = .slli,
+        .data = .{ .i_type = .{
+            .rd = value_reg,
+            .rs1 = value_reg,
+            .imm12 = Immediate.u(ptr_info.packed_offset.bit_offset),
+        } },
+    });
+
+    _ = try func.addInst(.{
+        .tag = .xori,
+        .data = .{ .i_type = .{
+            .rd = value_reg,
+            .rs1 = value_reg,
+            .imm12 = Immediate.s(-1),
+        } },
+    });
+
+    _ = try func.addInst(.{
+        .tag = .@"and",
+        .data = .{ .r_type = .{
+            .rd = dst_reg,
+            .rs1 = dst_reg,
+            .rs2 = value_reg,
+        } },
+    });
+
+    try func.genSetReg(Type.u64, value_reg, src_mcv);
+    _ = try func.addInst(.{
+        .tag = .slli,
+        .data = .{ .i_type = .{
+            .imm12 = Immediate.u(ptr_info.packed_offset.bit_offset),
+            .rd = value_reg,
+            .rs1 = value_reg,
+        } },
+    });
+
+    _ = try func.addInst(.{
+        .tag = .@"or",
+        .data = .{ .r_type = .{
+            .rd = dst_reg,
+            .rs1 = dst_reg,
+            .rs2 = value_reg,
+        } },
+    });
+
+    try func.genCopy(Type.u64, deref_mcv, dst_mcv);
 }
 
 /// Loads `value` into the "payload" of `pointer`.
@@ -4770,7 +4881,25 @@ fn airStructFieldVal(func: *Func, inst: Air.Inst.Index) !void {
                     break :result dst_mcv;
                 }
 
-                return func.fail("TODO: airStructFieldVal load_frame field_off non multiple of 8", .{});
+                if (field_abi_size > 8) {
+                    return func.fail("TODO implement load_frame with large packed field", .{});
+                }
+                const load_offset: i32 = @intCast(field_off / 8);
+                const field_mcv = src_mcv.address().offset(load_offset).deref();
+                const dst_reg, const dst_lock = try func.allocReg(func.typeRegClass(field_ty));
+                const dst_mcv = MCValue{ .register = dst_reg };
+                defer func.register_manager.unlockReg(dst_lock);
+                try func.genSetReg(Type.u64, dst_reg, field_mcv);
+                _ = try func.addInst(.{
+                    .tag = .srli,
+                    .data = .{ .i_type = .{
+                        .imm12 = Immediate.u(field_off % 8),
+                        .rd = dst_reg,
+                        .rs1 = dst_reg,
+                    } },
+                });
+                try func.truncateRegister(field_ty, dst_reg);
+                break :result dst_mcv;
             },
             else => return func.fail("TODO: airStructField {s}", .{@tagName(src_mcv)}),
         }
@@ -6392,6 +6521,14 @@ fn airAsm(func: *Func, inst: Air.Inst.Index) !void {
                                     .imm12 = imm1,
                                 } },
                             }),
+                            .reg => |reg3| try func.addInst(.{
+                                .tag = mnem,
+                                .data = .{ .r_type = .{
+                                    .rd = reg1,
+                                    .rs1 = reg2,
+                                    .rs2 = reg3,
+                                } },
+                            }),
                             else => error.InvalidInstruction,
                         },
                         .imm => |imm1| switch (ops[2]) {
@@ -6405,6 +6542,22 @@ fn airAsm(func: *Func, inst: Air.Inst.Index) !void {
                                     } },
                                 }),
                                 .ld => try func.addInst(.{
+                                    .tag = mnem,
+                                    .data = .{ .i_type = .{
+                                        .rd = reg1,
+                                        .rs1 = reg2,
+                                        .imm12 = imm1,
+                                    } },
+                                }),
+                                .sw => try func.addInst(.{
+                                    .tag = mnem,
+                                    .data = .{ .i_type = .{
+                                        .rd = reg1,
+                                        .rs1 = reg2,
+                                        .imm12 = imm1,
+                                    } },
+                                }),
+                                .csrrw => try func.addInst(.{
                                     .tag = mnem,
                                     .data = .{ .i_type = .{
                                         .rd = reg1,
@@ -6512,6 +6665,36 @@ fn airAsm(func: *Func, inst: Air.Inst.Index) !void {
                                 .rs2 = .zero,
                                 .inst = ops[1].inst,
                             } },
+                        });
+                    },
+                    .csrr => blk: {
+                        if (ops[0] != .reg or ops[1] != .imm) {
+                            break :blk error.InvalidInstruction;
+                        }
+                        _ = try func.addInst(.{
+                            .tag = .csrrs,
+                            .data = .{
+                                .i_type = .{
+                                    .imm12 = ops[1].imm,
+                                    .rs1 = .x0,
+                                    .rd = ops[0].reg,
+                                },
+                            },
+                        });
+                    },
+                    .csrw => blk: {
+                        if (ops[0] != .imm or ops[1] != .reg) {
+                            break :blk error.InvalidInstruction;
+                        }
+                        _ = try func.addInst(.{
+                            .tag = .csrrs,
+                            .data = .{
+                                .i_type = .{
+                                    .imm12 = ops[0].imm,
+                                    .rs1 = ops[1].reg,
+                                    .rd = .x0,
+                                },
+                            },
                         });
                     },
                 })) catch |err| {
